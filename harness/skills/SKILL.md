@@ -137,6 +137,10 @@ observer with `deliver: 'output'` receives the event itself:
   (`completed` / `cancelled` / `failed`), carrying the result or error for
   chaining, failure toasts, auto-titling, and result delivery; `terminal` is
   `false` while the session still owns an armed wake.
+- `harness::on-turn-overdue` — a turn is still running at a check point
+  (`overdue_after_ms`, then every `overdue_every_ms`; 20 min each by
+  default). The one turn event an agent may observe; it never reports the
+  observer's own turn.
 - `harness::on-message-queued`, `harness::on-observers-changed`,
   `harness::on-compaction`, `harness::on-session-tree-deletion` and
   `harness::on-ready` — see the worker README for their events.
