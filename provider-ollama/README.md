@@ -1,0 +1,134 @@
+# provider-ollama
+
+llama.cpp server ([`llama-server`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md))
+Chat Completions provider worker behind [llm-router](https://github.com/iii-hq/workers/tree/main/llm-router).
+Implements the provider protocol from
+`tech-specs/2026-06-agentic/llm-router.md`: `provider::ollama::stream`
+(SSE chunks → `AssistantMessageEvent` frames into a router-owned channel) and
+`provider::ollama::refresh_models` (live `GET /v1/models` + `GET /props` →
+`router::models::reconcile`).
+
+Default upstream: `http://127.0.0.1:8080/v1/chat/completions`, `llama-server`'s
+own default bind address and port. With no `api_url` configured, discovery
+also tries `http://127.0.0.1:9931`, the Llama desktop app's default port, and
+every later request follows whichever of the two answered. Point `api_url` at
+any running `llama-server` instance (local, LAN, or a remote box) to use it.
+
+Default model: after each discovery the provider re-declares `default_models`
+as the served models ranked loaded first (router-mode servers report
+`status.value`; a classic single-model server is loaded), then by the
+parameter count in the id (`27B` beats `8B`), ties in the server's listing
+order. A `harness::send` that names only the provider, and a new ADE chat,
+start on the first of those the router finds in the catalog.
+
+## Embeddings
+
+`provider::ollama::embed` serves batch text embeddings from the same configured server when llama-server runs with `--embeddings` and an embedding-capable model (e.g. a nomic-embed GGUF). One vector per input, order preserved; behind `router::embed`, this gives the memory worker fully local semantic recall with no cloud call.
+
+`provider::ollama::count_tokens` counts a prompt through the server's
+`/v1/chat/completions/input_tokens` route behind `router::count_tokens`,
+with the same body the chat request sends (tools, images and
+`chat_template_kwargs` included). A llama-server older than that route
+(June 2026) answers 404 and is counted through the Anthropic-compatible
+`/v1/messages/count_tokens` route, which drops tool definitions, call-only
+assistant turns and images, so update llama-server for exact counts. The count uses the tokenizer baked into whichever
+GGUF is loaded, which is the only way to be right about a model the operator
+chose. Counting is local and never runs the model.
+
+## Behavior
+
+- **Registration:** self-declares via `router::provider::register` with
+  backoff until acked, and re-declares on every `router::on-ready` event
+  (it observes that function at boot; the observer outlives router restarts).
+  The declaration carries no models and `credential_env_var:
+  OLLAMA_API_KEY`; the post-register refresh discovers the live catalog
+  from the resolved server.
+- **Identity binding:** the router returns a `registration_token` on first
+  registration; it is persisted in state (scope `provider-ollama`,
+  key `registration_token`) and presented on every later
+  `register`/`resolve`/`reconcile`. If that state is lost the router rejects
+  re-registration — the operator must clear the binding on the router side.
+- **Credentials are optional** — the main difference from every other
+  provider here. `llama-server` only requires `Authorization: Bearer` when
+  started with `--api-key`; most local setups run with none at all. Streaming
+  and discovery both resolve credentials via `router::provider::resolve` as
+  usual, but a missing/blank credential is treated as "no key configured",
+  not a configuration error: requests simply go out with no `Authorization`
+  header. If the server *does* have `--api-key` set and ours is missing or
+  wrong, the server's 401/403 surfaces as the normal `auth_expired` error.
+  The declaration sets `credential_optional: true`, so the router reports
+  llama.cpp `configured` without a key and consoles offer its models.
+- **Catalog:** `src/discovery.rs` discovers the catalog live — `GET
+  /v1/models` lists every id the server serves (no "gpt-"-style family gate:
+  llama.cpp serves arbitrary GGUF aliases, so every id is kept), enriched
+  with the runtime context size and vision-modality support. The window is
+  the operator's `--ctx-size`, never `meta.n_ctx_train` (the model's
+  *trained* max): a single-model server reports it as `n_ctx` on `GET
+  /props`; a router-mode server (`llama serve`, the Llama desktop app)
+  reports `n_ctx: 0` there, which is ignored, and each `/v1/models` row
+  carries the instance's launch args, from which `--ctx-size` is read. The
+  server rejects any prompt over that window, so a console cannot work
+  around a small one by compacting; the declaration carries a
+  `context_overflow_hint` (`register.rs`) that the router reports on
+  `router::provider::list` and the ADE shows under its context-overflow
+  card, pointing at the server's `--ctx-size`, the desktop app's per-model
+  options, the llama.cpp server docs and the provider restart that picks the
+  new size up (`iii call compose::restart` or the Workers page). No
+  pricing (self-hosted).
+- **Liveness:** `ping` at least every 30s of upstream silence; a failed
+  channel write (caller gone / `router::abort`) drops the SSE receiver and
+  aborts the in-flight HTTP request.
+- **Errors:** 401/403 → `auth_expired` (only reachable when `--api-key` is
+  set), `context_length_exceeded`/message-sniffed prompt-overflow phrasing →
+  `context_overflow`, 5xx/network → `transient`, other 4xx → `permanent`. No
+  transport retries here — the router owns retry policy.
+- **Structured output:** real schema-constrained decoding, unlike
+  `json_object`-only providers — `response_format: {"type": "json_schema",
+  "schema": {...}}` (llama.cpp nests the schema directly, not under an extra
+  OpenAI-style `json_schema` wrapper key), or `{"type": "json_object"}` with
+  no schema. Every discovered model advertises
+  `supports_structured_output: true`.
+- **Reasoning:** llama.cpp has no dedicated per-request reasoning switch. Its
+  only lever is the `enable_thinking` chat-template kwarg, so a requested
+  `thinking_level` is mapped best-effort onto `chat_template_kwargs:
+  {"enable_thinking": …}` (any level → `true`, absent → `false`) — which
+  reasoning GGUFs conventionally gate their thinking channel on. It is
+  effective only if the model's chat template references that key; otherwise
+  reasoning stays whatever the server's `--reasoning-format` flag and template
+  dictate, and a report-and-continue warning notes the mapping is best-effort.
+  When the server runs with `--reasoning-format deepseek`, chain-of-thought
+  streams as `reasoning_content` deltas, which this worker surfaces as
+  `thinking` blocks on the channel (`src/sse.rs`).
+- **Tool calling:** requires the server be started with `--jinja` and a
+  chat template that supports tool calls; tool schemas ride as the standard
+  OpenAI `{"type":"function","function":{...}}` envelope. Every discovered
+  model optimistically advertises `supports_tools: true` — llama.cpp
+  silently ignores tools a template can't use, so this never breaks
+  non-tool turns.
+- **Prompt caching:** `cache_prompt` reuse is a server-side default in
+  llama.cpp, not something this provider requests explicitly.
+
+## Tests
+
+```bash
+cargo test                                            # unit (pure modules + TCP stubs)
+III_ENGINE_BIN=$(which iii) cargo test --test integration -- --test-threads=1
+```
+
+The integration suite spawns a real engine, the real router (path dep), this
+provider, and a local stub upstream — no external servers required.
+
+## Running
+
+The binary takes the standard worker CLI flags: `--url` (engine WebSocket,
+default `ws://127.0.0.1:49134`, falls back to the `III_WS_URL` environment
+variable), `--manifest` (print the registry manifest and exit), and
+`--config` (accepted but ignored with a warning — provider config comes
+from the `llm-router` configuration entry).
+
+Point it at a real `llama-server`:
+
+```bash
+llama-server -m /path/to/model.gguf --jinja --port 8080
+cargo run -- --url ws://127.0.0.1:49134
+```

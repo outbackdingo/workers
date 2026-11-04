@@ -1,0 +1,489 @@
+//! Engine-backed integration suite — real engine, real router, real provider,
+//! stubbed upstream. Self-skips when no engine is available.
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use iii_sdk::{register_worker, CallRequest, IIIClient};
+use llm_router::register::register_router;
+use provider_ollama::register::register_provider;
+use serde_json::{json, Value};
+
+// ── engine bootstrap ── shared with llm-router and every provider suite; see
+// llm-router/tests/support/engine_fixture.rs for what it spawns (bare engine +
+// standalone state worker) and the skip-vs-fail policy.
+#[path = "../../llm-router/tests/support/engine_fixture.rs"]
+mod engine_fixture;
+use engine_fixture::*;
+
+async fn call(
+    iii: &IIIClient,
+    function_id: &str,
+    payload: Value,
+) -> Result<Value, iii_sdk::errors::Error> {
+    iii.call(CallRequest {
+        function_id: function_id.into(),
+        payload,
+        action: None,
+        timeout_ms: Some(10_000),
+    })
+    .await
+}
+
+/// Consumer-side channel: collect frames + a pump that drives dispatch.
+async fn consumer_channel(
+    iii: &IIIClient,
+) -> (
+    iii_sdk::channel::StreamChannelRef,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let channel = iii_sdk::helpers::create_channel(iii, None)
+        .await
+        .expect("channel");
+    let frames = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let f2 = frames.clone();
+    channel
+        .reader
+        .on_message(move |m| {
+            f2.lock().unwrap().push(m);
+        })
+        .await;
+    let writer_ref = channel.writer_ref.clone();
+    let pump = tokio::spawn(async move {
+        let _ = channel.reader.read_all().await;
+    });
+    (writer_ref, frames, pump)
+}
+
+// ── stub upstream ───────────────────────────────────────────────────────────
+
+/// Serves `chat_response` for any `/v1/chat/completions` request, and canned
+/// `/v1/models` + `/props` bodies for discovery — a single llama-server stub
+/// good enough for both the streaming and the catalog-discovery scenarios.
+/// Captures each request's raw head (request line + headers) so tests can
+/// assert on what was (or wasn't) sent, e.g. no `Authorization` header when
+/// no credential is configured.
+struct StubUpstream {
+    url: String, // http://addr/v1/chat/completions — what goes in the config slice
+    handle: tokio::task::JoinHandle<()>,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Drop for StubUpstream {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+const STUB_SSE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\ndata: [DONE]\n\n";
+
+const STUB_401: &str = "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"Incorrect API key provided.\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}}";
+
+const STUB_MODEL_ID: &str = "llama-test-model";
+
+const STUB_MODELS_BODY: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"object\":\"list\",\"data\":[{\"id\":\"llama-test-model\",\"object\":\"model\",\"owned_by\":\"llamacpp\"}]}";
+
+const STUB_PROPS_BODY: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"default_generation_settings\":{\"n_ctx\":8192},\"modalities\":{\"vision\":false,\"audio\":false}}";
+
+async fn stub_upstream(chat_response: &'static str) -> StubUpstream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let requests2 = requests.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let requests = requests2.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                requests.lock().unwrap().push(head);
+                let body = if path.starts_with("/v1/models") {
+                    STUB_MODELS_BODY
+                } else if path.starts_with("/props") {
+                    STUB_PROPS_BODY
+                } else {
+                    chat_response
+                };
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    StubUpstream {
+        url: format!("http://{addr}/v1/chat/completions"),
+        handle,
+        requests,
+    }
+}
+
+// ── boot + config ───────────────────────────────────────────────────────────
+
+/// Boot router + provider on one engine; wait until the provider is listed.
+async fn boot_stack(engine_url: &str) -> (IIIClient, IIIClient) {
+    // A real key exported on the host would ride the router's env-var
+    // fallback into every resolve and defeat the no-credential assertions
+    // below. The provider itself sends no Authorization header without a
+    // credential (request.rs); the leak is purely environmental. Strip the
+    // variable exactly once per process, before the first router or provider
+    // boots: every in-process read happens after this single mutation and
+    // no test ever sets the variable, so concurrent tests cannot race it.
+    static STRIP_HOST_KEY: std::sync::Once = std::sync::Once::new();
+    STRIP_HOST_KEY.call_once(|| std::env::remove_var("OLLAMA_API_KEY"));
+    let router_iii = register_worker(engine_url, test_init_options());
+    register_router(router_iii.clone())
+        .await
+        .expect("router boots");
+    let provider_iii = register_worker(engine_url, test_init_options());
+    register_provider(provider_iii.clone())
+        .await
+        .expect("provider boots");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let list = call(&router_iii, "router::provider::list", json!({}))
+            .await
+            .unwrap();
+        let registered = list["providers"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|x| x["id"] == "ollama"));
+        if registered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider never registered: {list}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    (router_iii, provider_iii)
+}
+
+/// Point the llamacpp slice at the stub, with an (unnecessary but harmless)
+/// api_key configured.
+async fn configure_stub_key(router_iii: &IIIClient, stub_url: &str) {
+    call(
+        router_iii,
+        "configuration::set",
+        json!({ "id": "llm-router", "value": { "providers": {
+            "ollama": { "api_key": "sk-test", "api_url": stub_url }
+        } } }),
+    )
+    .await
+    .expect("config set");
+}
+
+/// Point the llamacpp slice at the stub with NO credential — the common
+/// local llama.cpp setup (no `--api-key` on the server).
+async fn configure_stub_no_key(router_iii: &IIIClient, stub_url: &str) {
+    call(
+        router_iii,
+        "configuration::set",
+        json!({ "id": "llm-router", "value": { "providers": {
+            "ollama": { "api_url": stub_url }
+        } } }),
+    )
+    .await
+    .expect("config set");
+}
+
+/// Call `provider::ollama::refresh_models`, retrying while the router's
+/// in-memory configuration snapshot has not yet absorbed the test's
+/// `configuration::set` (`configuration::on-updated` reaches the router
+/// asynchronously, so an immediate refresh can still resolve the pre-set
+/// default api_url and fail to connect). Unlike the keyed cloud providers —
+/// whose refresh no-ops until a credential is visible — llamacpp's
+/// credential-less refresh actually dials the default URL, so the
+/// propagation window surfaces as a transient error here. The retry never
+/// masks a real failure: discovery against the stub either succeeds within
+/// the deadline or the last error is surfaced.
+async fn refresh_models(provider_iii: &IIIClient) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match call(
+            provider_iii,
+            "provider::ollama::refresh_models",
+            json!({}),
+        )
+        .await
+        {
+            Ok(res) => return res,
+            Err(e) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "refresh_models kept failing (configuration never propagated?): {e:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Discover the live catalog and wait until routing can see it.
+async fn refresh_and_wait(router_iii: &IIIClient, provider_iii: &IIIClient, expect_id: &str) {
+    let res = refresh_models(provider_iii).await;
+    assert_eq!(res["ok"], true, "refresh response: {res}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = call(
+            router_iii,
+            "router::models::list",
+            json!({ "provider": "ollama" }),
+        )
+        .await
+        .unwrap();
+        let present = list["models"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|m| m["id"] == expect_id));
+        if present {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "catalog never gained {expect_id}: {list}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ── scenarios ───────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_registers_with_persisted_token_and_discovers_catalog_without_a_credential() {
+    let engine = engine_or_skip!();
+    let stub = stub_upstream(STUB_SSE).await;
+    let (router_iii, provider_iii) = boot_stack(&engine.url).await;
+    configure_stub_no_key(&router_iii, &stub.url).await;
+
+    // Unlike every cloud provider here, no credential is required at all:
+    // discovery succeeds and reconciles the stub's one model.
+    let res = refresh_models(&provider_iii).await;
+    assert_eq!(res["ok"], true, "refresh response: {res}");
+    assert_eq!(
+        res["count"], 1,
+        "no-credential discovery still lands: {res}"
+    );
+    let list = call(
+        &router_iii,
+        "router::models::list",
+        json!({ "provider": "ollama" }),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = list["models"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|m| m["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(ids, vec![STUB_MODEL_ID]);
+
+    // The registration token lands in the provider's state scope; the write
+    // races provider visibility (the router lists the provider before the
+    // register response returns), so poll.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let token = call(
+            &provider_iii,
+            "state::get",
+            json!({ "scope": "provider-ollama", "key": "registration_token" }),
+        )
+        .await
+        .unwrap();
+        if token.as_str().is_some_and(|t| !t.is_empty()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "token never persisted, got {token}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    router_iii.shutdown();
+    provider_iii.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_streams_end_to_end_with_no_credential_and_no_authorization_header() {
+    let engine = engine_or_skip!();
+    let stub = stub_upstream(STUB_SSE).await;
+    let (router_iii, provider_iii) = boot_stack(&engine.url).await;
+    configure_stub_no_key(&router_iii, &stub.url).await;
+    refresh_and_wait(&router_iii, &provider_iii, STUB_MODEL_ID).await;
+
+    let consumer = register_worker(&engine.url, test_init_options());
+    let (writer_ref, frames, pump) = consumer_channel(&consumer).await;
+    let res = consumer
+        .call(CallRequest {
+            function_id: "router::chat".into(),
+            payload: json!({
+                "writer_ref": writer_ref,
+                "model": STUB_MODEL_ID,
+                "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }], "timestamp": 1 }],
+            }),
+            action: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("chat succeeds");
+    assert_eq!(res["ok"], true, "chat response: {res}");
+    assert_eq!(res["provider"], "ollama");
+    assert_eq!(res["stop_reason"], "end");
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+    let frames = frames.lock().unwrap();
+    let first: Value = serde_json::from_str(frames.first().unwrap()).unwrap();
+    assert_eq!(first["type"], "start");
+    let last: Value = serde_json::from_str(frames.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "done");
+    assert_eq!(last["message"]["content"][0]["text"], "Hello");
+    assert_eq!(last["message"]["native_stop_reason"], "stop");
+    assert_eq!(last["message"]["usage"]["cache_read"], 4);
+
+    // The main behavioral divergence from every other provider here: no
+    // credential configured → no Authorization header sent at all.
+    let requests = stub.requests.lock().unwrap();
+    let chat_request = requests
+        .iter()
+        .find(|r| {
+            r.lines()
+                .next()
+                .is_some_and(|l| l.contains("/v1/chat/completions"))
+        })
+        .expect("chat request captured");
+    assert!(
+        !chat_request.to_ascii_lowercase().contains("authorization:"),
+        "no credential configured → no Authorization header, got:\n{chat_request}"
+    );
+
+    consumer.shutdown();
+    router_iii.shutdown();
+    provider_iii.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_401_surfaces_as_auth_expired_error_frame() {
+    let engine = engine_or_skip!();
+    let stub = stub_upstream(STUB_401).await;
+    let (router_iii, provider_iii) = boot_stack(&engine.url).await;
+    configure_stub_key(&router_iii, &stub.url).await;
+
+    let consumer = register_worker(&engine.url, test_init_options());
+    let (writer_ref, frames, pump) = consumer_channel(&consumer).await;
+    let res = consumer
+        .call(CallRequest {
+            function_id: "router::chat".into(),
+            payload: json!({
+                "writer_ref": writer_ref,
+                "model": STUB_MODEL_ID,
+                "provider": "ollama",
+                "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }], "timestamp": 1 }],
+            }),
+            action: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("chat resolves even on upstream failure");
+    assert_eq!(res["ok"], false, "chat response: {res}");
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+    let frames = frames.lock().unwrap();
+    let last: Value = serde_json::from_str(frames.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "error");
+    assert_eq!(last["error"]["error_kind"], "auth_expired");
+
+    consumer.shutdown();
+    router_iii.shutdown();
+    provider_iii.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_models_discovers_live_catalog_via_v1_models_and_props() {
+    let engine = engine_or_skip!();
+    let stub = stub_upstream(STUB_SSE).await;
+    let (router_iii, provider_iii) = boot_stack(&engine.url).await;
+    configure_stub_key(&router_iii, &stub.url).await;
+    refresh_and_wait(&router_iii, &provider_iii, STUB_MODEL_ID).await;
+
+    let list = call(
+        &router_iii,
+        "router::models::list",
+        json!({ "provider": "ollama" }),
+    )
+    .await
+    .unwrap();
+    let models = list["models"].as_array().unwrap().clone();
+    let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![STUB_MODEL_ID],
+        "live listing, not a curated table"
+    );
+
+    // rows carry the /props-derived runtime context, not a hand-maintained
+    // pricing table (self-hosted → no cost).
+    let model = &models[0];
+    assert_eq!(model["context_window"], 8192, "from /props' n_ctx");
+    assert_eq!(model["supports_structured_output"], true);
+    assert_eq!(model["supports_tools"], true);
+    assert_eq!(model["supports_vision"], false);
+    assert!(model.get("pricing").is_none_or(|p| p.is_null()));
+
+    router_iii.shutdown();
+    provider_iii.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_redeclares_on_router_ready() {
+    let engine = engine_or_skip!();
+    let (router_iii, provider_iii) = boot_stack(&engine.url).await;
+
+    // simulate a router restart that LOST its registry: wipe the persisted
+    // record so only a real re-declare (router::on-ready → on_router_ready →
+    // declare_and_refresh) can bring the provider back — a durable-registry
+    // restore alone must not satisfy this test.
+    router_iii.shutdown();
+    call(
+        &provider_iii,
+        "state::set",
+        json!({ "scope": "llm-router", "key": "registry", "value": {} }),
+    )
+    .await
+    .expect("wipe persisted registry");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let router2 = register_worker(&engine.url, test_init_options());
+    register_router(router2.clone())
+        .await
+        .expect("router reboots");
+
+    // router::on-ready → provider re-declares with its persisted token
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let list = call(&router2, "router::provider::list", json!({}))
+            .await
+            .unwrap();
+        let listed = list["providers"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|x| x["id"] == "ollama"));
+        if listed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider never re-declared: {list}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    router2.shutdown();
+    provider_iii.shutdown();
+}
