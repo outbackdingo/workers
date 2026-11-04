@@ -1,0 +1,11 @@
+# provider-local has no file-based configuration.
+#
+# Per-server settings (api_url, api_key, max_tokens) arrive per request from
+# llm-router's resolve step and live in the engine's `llm-router`
+# configuration entry. The knobs only this worker owns - which engines are
+# enabled, and a context-window override for servers that do not declare one
+# - live in the `provider-local` configuration entry (README section
+# Configuration).
+#
+# This file exists to satisfy the standard worker layout. Keys placed here are
+# ignored with a warning.

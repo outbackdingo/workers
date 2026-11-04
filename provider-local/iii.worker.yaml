@@ -1,0 +1,15 @@
+iii: v1
+name: provider-local
+language: rust
+deploy: binary
+iii_engine_version: ">=0.26.0"
+manifest: Cargo.toml
+license: Apache-2.0
+bin: provider-local
+tags: [llm, local, open-source, provider, vllm, sglang, prisml, mistralrs]
+description: Local OpenAI-compatible inference servers (vLLM, SGLang, PrismML, mistral.rs) as llm-router providers, each declaring its real context window.
+
+dependencies:
+  state: "latest"
+  llm-router: "latest"
+  configuration: "latest"
