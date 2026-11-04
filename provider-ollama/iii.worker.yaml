@@ -1,0 +1,14 @@
+iii: v1
+name: provider-ollama
+language: rust
+deploy: binary
+iii_engine_version: ">=0.26.0"
+manifest: Cargo.toml
+license: Apache-2.0
+bin: provider-ollama
+tags: [llm, ollama, cloud, local, open-source, provider]
+description: Ollama (hosted or local) Chat Completions provider worker; implements provider::ollama::stream and provider::ollama::refresh_models behind llm-router, reading Ollama's per-model context windows.
+
+dependencies:
+  state: "latest"
+  llm-router: "latest"
